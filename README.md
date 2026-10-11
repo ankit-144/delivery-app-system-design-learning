@@ -16,6 +16,9 @@ with a decision that looks reasonable, then you:
 4. learn **what can still go wrong**.
 
 **Just want to run it?** [docs/CHEATSHEET.md](docs/CHEATSHEET.md): start, check, every dashboard and tool link, stop.
+**The big picture?** Open [docs/architecture.html](docs/architecture.html) in a browser: topology, life of an order,
+monitoring pipeline, all phase by phase.
+**Teaching with it?** [docs/TEACHING_GUIDE.md](docs/TEACHING_GUIDE.md): ten sessions, the commands, what to show, what to expect.
 
 The full plan is in [ROADMAP.md](ROADMAP.md). Scenarios that can't be reproduced on a laptop are
 written up in [docs/FAILURE_TRACKER.md](docs/FAILURE_TRACKER.md).

@@ -6,3 +6,6 @@ target/
 loadtest/results/
 .phase
 .gameday
+
+# Obsidian editor settings
+.obsidian/

@@ -1,6 +1,6 @@
 # QuickDrop cheat sheet
 
-Start, check, watch, stop. Everything runs locally in Docker.
+Start, check, watch, stop. Everything runs locally in Docker. The architecture diagram is [architecture.html](architecture.html) (open it in a browser). Running a class? [TEACHING_GUIDE.md](TEACHING_GUIDE.md).
 
 ## 1. Start
 
@@ -62,22 +62,22 @@ one to open that request's trace.
    traces:  every service ──▶ Tempo ──▶ Grafana          alerts: Prometheus ──▶ Alertmanager ──▶ notification-1
 ```
 
-| What | URL / command | Notes |
-|---|---|---|
-| nginx (load balancer) | http://localhost:8080 · http://localhost:8080/nginx_status | `make lb ALGO=least-conn` switches algorithm |
-| core instances | http://localhost:8081/admin/toggles · `/actuator/health` · `/actuator/prometheus` | 8082, 8083 = core-2, core-3 |
-| notification-service | http://localhost:8091/api/alerts · http://localhost:8091/admin/toggles | 8092 = notification-2 |
-| vendor-mock (fake SMS) | http://localhost:8090/v1/stats | `make vendor NAME=latency-ms VALUE=1000` |
-| Toxiproxy (network faults) | http://localhost:8474/proxies | `make toxics` · `make clear-toxics` |
-| Postgres | `make psql` · localhost:5432 (`quickdrop`/`quickdrop`) | replica 5433, shards 5434/5435 (Phase 5) |
-| Redis | `docker exec -it qd-redis redis-cli` | `SLOWLOG GET 5`, `INFO memory` |
-| Kafka UI | http://localhost:8085 | topics, consumer groups, messages |
-| Kafka CLI | `docker exec qd-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups` | lag per partition |
-| Prometheus | http://localhost:9090 · [/targets](http://localhost:9090/targets) · [/alerts](http://localhost:9090/alerts) · [/rules](http://localhost:9090/rules) | rules in `infra/prometheus/rules/` |
-| Alertmanager | http://localhost:9093 | routes to notification-1's webhook |
-| Tempo | Grafana → Explore → Tempo · http://localhost:3200/ready | `/ready` can say "not ready" for a moment now and then: retry |
-| Loki | Grafana → Explore → Loki | no host port; Alloy ships every container's logs |
-| cAdvisor | Containers dashboard | no host port |
+| What                       | URL / command                                                                                                                                       | Notes                                                         |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| nginx (load balancer)      | http://localhost:8080 · http://localhost:8080/nginx_status                                                                                          | `make lb ALGO=least-conn` switches algorithm                  |
+| core instances             | http://localhost:8081/admin/toggles · `/actuator/health` · `/actuator/prometheus`                                                                   | 8082, 8083 = core-2, core-3                                   |
+| notification-service       | http://localhost:8091/api/alerts · http://localhost:8091/admin/toggles                                                                              | 8092 = notification-2                                         |
+| vendor-mock (fake SMS)     | http://localhost:8090/v1/stats                                                                                                                      | `make vendor NAME=latency-ms VALUE=1000`                      |
+| Toxiproxy (network faults) | http://localhost:8474/proxies                                                                                                                       | `make toxics` · `make clear-toxics`                           |
+| Postgres                   | `make psql` · localhost:5432 (`quickdrop`/`quickdrop`)                                                                                              | replica 5433, shards 5434/5435 (Phase 5)                      |
+| Redis                      | `docker exec -it qd-redis redis-cli`                                                                                                                | `SLOWLOG GET 5`, `INFO memory`                                |
+| Kafka UI                   | http://localhost:8085                                                                                                                               | topics, consumer groups, messages                             |
+| Kafka CLI                  | `docker exec qd-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups`                            | lag per partition                                             |
+| Prometheus                 | http://localhost:9090 · [/targets](http://localhost:9090/targets) · [/alerts](http://localhost:9090/alerts) · [/rules](http://localhost:9090/rules) | rules in `infra/prometheus/rules/`                            |
+| Alertmanager               | http://localhost:9093                                                                                                                               | routes to notification-1's webhook                            |
+| Tempo                      | Grafana → Explore → Tempo · http://localhost:3200/ready                                                                                             | `/ready` can say "not ready" for a moment now and then: retry |
+| Loki                       | Grafana → Explore → Loki                                                                                                                            | no host port; Alloy ships every container's logs              |
+| cAdvisor                   | Containers dashboard                                                                                                                                | no host port                                                  |
 
 ## 5. Run a scenario
 
