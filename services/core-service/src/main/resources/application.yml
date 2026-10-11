@@ -1,0 +1,124 @@
+# Limits are deliberately small so that bottlenecks are reachable on a laptop.
+# Everything can be overridden with environment variables (see infra/docker-compose.yml).
+spring:
+  application:
+    name: core-service
+  threads:
+    virtual:
+      enabled: ${VIRTUAL_THREADS:false}          # scenario 2.8
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/quickdrop}
+    username: ${DB_USER:quickdrop}
+    password: ${DB_PASSWORD:quickdrop}
+    hikari:
+      pool-name: core-pool
+      maximum-pool-size: ${DB_POOL_SIZE:10}       # scenarios 2.2 / 2.3
+      connection-timeout: ${DB_POOL_TIMEOUT_MS:5000}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        session_factory:
+          statement_inspector: dev.quickdrop.core.observability.SqlStatementCounter
+  flyway:
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}   # Kafka runs from Phase 6; the producer connects on first use
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+        max.block.ms: 5000
+    template:
+      observation-enabled: ${TRACING_ENABLED:false}   # Phase 8: trace context travels in Kafka headers
+  data:
+    redis:
+      # Through Toxiproxy (see docker-compose.yml). Redis only runs from Phase 3; until then nothing calls it.
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # Lettuce's default command timeout is 60 s: a hung Redis would hang every request for a minute (scenario 3.9).
+      timeout: ${REDIS_TIMEOUT_MS:1000}
+      connect-timeout: 1s
+
+server:
+  port: 8080
+  shutdown: ${SERVER_SHUTDOWN:graceful}            # scenario 3.7
+  tomcat:
+    threads:
+      max: ${TOMCAT_MAX_THREADS:50}               # scenario 2.1
+    accept-count: ${TOMCAT_ACCEPT_COUNT:100}
+    mbeanregistry:
+      enabled: true                                # exposes tomcat_threads_busy_threads
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  health:
+    redis:
+      enabled: false   # a Redis outage must not make core look dead to the load balancer (scenario 3.9)
+    kafka:
+      enabled: false
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        http.client.requests: true
+        quickdrop.order.placement: true
+        quickdrop.inventory.reservation: true
+  # Phase 8: distributed tracing. Off until `make up PHASE=8` sets TRACING_ENABLED=true and starts Tempo.
+  tracing:
+    enabled: ${TRACING_ENABLED:false}
+    sampling:
+      probability: ${TRACING_SAMPLING:1.0}   # 100%: fine for a lab, far too much for production traffic (see 8.1)
+  otlp:
+    tracing:
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://tempo:4318/v1/traces}
+  observations:
+    enable:
+      "[tasks.scheduled]": false   # background polling (outbox relay every 200 ms, invariant checker) would flood Tempo
+
+quickdrop:
+  instance-name: ${INSTANCE_NAME:core-local}
+  toggles:
+    # Infra knobs start from the same env vars as the Spring settings above, then can be changed live.
+    tomcat-max-threads: ${TOMCAT_MAX_THREADS:50}
+    db-pool-size: ${DB_POOL_SIZE:10}
+    db-pool-timeout-ms: ${DB_POOL_TIMEOUT_MS:5000}
+  grafana:
+    url: ${GRAFANA_URL:}
+  vendor:
+    base-url: ${VENDOR_URL:http://localhost:8090}
+  replica:
+    url: ${REPLICA_DB_URL:${spring.datasource.url}}   # Phase 5: the read replica; until then, the primary
+  shards:
+    urls: ${SHARD_URLS:}                                # Phase 5 sharding lab: comma-separated JDBC URLs
+  notify:
+    urls: ${NOTIFY_URLS:http://localhost:8091}          # Phase 6: notification-service instances
+
+logging:
+  level:
+    org.hibernate.engine.jdbc.spi.SqlExceptionHelper: ERROR
+
+# Phase 8: a span for every connection checkout and SQL statement (datasource-micrometer), only when tracing is on.
+jdbc:
+  datasource-proxy:
+    enabled: ${TRACING_ENABLED:false}
+    include-parameter-values: false
+  includes: CONNECTION, QUERY
+  # The raw pools are injected as HikariDataSource (RuntimeKnobs resizes them); a JDK proxy can't be. The routing
+  # DataSource in front of them, which every query goes through, is still traced.
+  excluded-datasource-bean-names: primaryPool, replicaPool

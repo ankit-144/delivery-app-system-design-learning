@@ -1,0 +1,29 @@
+# Alertmanager (Phase 8, scenario 8.2): groups, deduplicates and routes the alerts Prometheus fires.
+# Everything goes to a webhook in notification-service, standing in for PagerDuty/Opsgenie/Slack.
+global:
+  resolve_timeout: 1m
+
+route:
+  receiver: quickdrop-webhook
+  group_by: [alertname]
+  group_wait: 10s        # wait a little so alerts that fire together arrive as one notification
+  group_interval: 30s    # how often to send updates for a group that's already firing
+  repeat_interval: 30m   # re-notify a still-firing alert (production: hours)
+  routes:
+    - matchers: ['alertname="Watchdog"']
+      receiver: quickdrop-webhook
+      group_wait: 0s
+      repeat_interval: 1m   # the heartbeat: if it stops arriving, alerting is broken
+
+receivers:
+  - name: quickdrop-webhook
+    webhook_configs:
+      # Deliberately only notification-1: a page that depends on one instance of the system being monitored is
+      # a single point of failure (see 8.2, "who watches the watchers").
+      - url: http://notification-1:8080/api/alerts
+        send_resolved: true
+
+inhibit_rules:
+  # While a customer-facing alert is paging, don't also send the "cause" warnings for the same thing.
+  - source_matchers: ['severity="page"']
+    target_matchers: ['kind="cause"']

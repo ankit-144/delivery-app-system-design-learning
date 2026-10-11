@@ -1,0 +1,668 @@
+# QuickDrop local production-like environment.
+#
+#   make up                 # Phase 0-2: one core instance + observability
+#   make up PHASE=3         # adds core-2, core-3 and Redis
+#
+# Services without a profile always start. Profiles add the pieces later phases need.
+# CPU and memory are capped on purpose: on a 16-core laptop nothing would ever saturate.
+#
+# Host ports:  8080 nginx (the API)    8081-8083 core instances directly    8090 vendor-mock
+#              3000 Grafana             9090 Prometheus                      8474 Toxiproxy API
+#              5432 Postgres (override with PG_PORT)
+
+name: quickdrop
+
+x-defaults: &defaults
+  restart: unless-stopped
+  # Fedora/RHEL enforce SELinux on bind mounts; this is a no-op elsewhere.
+  security_opt: [label=disable]
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "3" }
+
+x-core: &core
+  <<: *defaults
+  image: quickdrop/core-service:local
+  build: { context: .., dockerfile: Dockerfile, target: core-service }
+  pull_policy: build
+  cpus: ${CORE_CPUS:-1.0}
+  mem_limit: ${CORE_MEMORY:-768m}
+  depends_on:
+    postgres: { condition: service_healthy }
+    toxiproxy: { condition: service_started }
+  labels:
+    quickdrop.scrape: "true"
+    quickdrop.job: core
+    quickdrop.metrics_port: "8080"
+    quickdrop.metrics_path: /actuator/prometheus
+  healthcheck:
+    # bash, not sh: /bin/sh is dash on this image and has no /dev/tcp
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /actuator/health/readiness HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+    interval: 5s
+    timeout: 3s
+    start_period: 60s
+    retries: 3
+
+x-core-env: &core-env
+  DB_URL: jdbc:postgresql://toxiproxy:15432/quickdrop
+  REPLICA_DB_URL: ${REPLICA_DB_URL:-jdbc:postgresql://toxiproxy:15432/quickdrop}   # the primary until Phase 5
+  SHARD_URLS: ${SHARD_URLS:-}   # Phase 5 sharding lab; empty = disabled
+  KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-kafka:9092}   # Kafka runs from Phase 6
+  NOTIFY_URLS: http://notification-1:8080,http://notification-2:8080
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+  TOMCAT_MAX_THREADS: ${TOMCAT_MAX_THREADS:-50}
+  VIRTUAL_THREADS: ${VIRTUAL_THREADS:-false}
+  VENDOR_URL: http://toxiproxy:18090
+  REDIS_HOST: toxiproxy
+  REDIS_PORT: "16379"
+  GRAFANA_URL: http://grafana:3000
+  TRACING_ENABLED: ${TRACING_ENABLED:-false}   # Phase 8
+
+services:
+
+  # ---------------------------------------------------------------- data
+
+  postgres:
+    <<: *defaults
+    image: postgres:17.6
+    container_name: qd-postgres
+    cpus: ${PG_CPUS:-2.0}
+    mem_limit: 1536m
+    shm_size: 256m
+    environment:
+      POSTGRES_DB: quickdrop
+      POSTGRES_USER: quickdrop
+      POSTGRES_PASSWORD: quickdrop
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-100}
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - deadlock_timeout=1s
+      - -c
+      - log_lock_waits=on
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - track_io_timing=on
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf   # allows the replica to stream WAL (Phase 5)
+    ports: ["${PG_PORT:-5432}:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quickdrop -d quickdrop"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Read replica: a streaming copy of postgres, read-only (Phase 5).
+  postgres-replica:
+    <<: *defaults
+    image: postgres:17.6
+    container_name: qd-postgres-replica
+    profiles: [replica]
+    cpus: ${PG_CPUS:-2.0}
+    mem_limit: 1g
+    shm_size: 128m
+    entrypoint: ["bash", "/replica/entrypoint.sh"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata-replica:/var/lib/postgresql/data
+      - ./postgres/replica:/replica:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quickdrop -d quickdrop"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  postgres-replica-exporter:
+    <<: *defaults
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.18.1
+    container_name: qd-postgres-replica-exporter
+    profiles: [replica]
+    mem_limit: 128m
+    depends_on:
+      postgres-replica: { condition: service_healthy }
+    environment:
+      DATA_SOURCE_URI: postgres-replica:5432/quickdrop?sslmode=disable
+      DATA_SOURCE_USER: quickdrop
+      DATA_SOURCE_PASS: quickdrop
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: postgres-replica
+      quickdrop.metrics_port: "9187"
+      quickdrop.metrics_path: /metrics
+
+  # Two shards for the sharding lab (Phase 5, scenarios 5.2-5.8). Each is a separate Postgres.
+  pg-shard-0:
+    <<: *defaults
+    image: postgres:17.6
+    container_name: qd-pg-shard-0
+    profiles: [shards]
+    cpus: 1.0
+    mem_limit: 384m
+    environment: { POSTGRES_DB: quickdrop, POSTGRES_USER: quickdrop, POSTGRES_PASSWORD: quickdrop }
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=60"]
+    ports: ["5434:5432"]
+    volumes: [pgdata-shard-0:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U quickdrop -d quickdrop"], interval: 3s, timeout: 3s, retries: 30 }
+
+  pg-shard-1:
+    <<: *defaults
+    image: postgres:17.6
+    container_name: qd-pg-shard-1
+    profiles: [shards]
+    cpus: 1.0
+    mem_limit: 384m
+    environment: { POSTGRES_DB: quickdrop, POSTGRES_USER: quickdrop, POSTGRES_PASSWORD: quickdrop }
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=60"]
+    ports: ["5435:5432"]
+    volumes: [pgdata-shard-1:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U quickdrop -d quickdrop"], interval: 3s, timeout: 3s, retries: 30 }
+
+  redis:
+    <<: *defaults
+    image: redis:7.4.6
+    container_name: qd-redis
+    profiles: [redis]
+    cpus: 1.0
+    mem_limit: 512m
+    # Every setting here can be changed live with CONFIG SET (the Redis deep-dive scenarios do).
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - "60 1000"
+      - --appendonly
+      - ${REDIS_APPENDONLY:-no}   # Redis deep dive R4: REDIS_APPENDONLY=yes make up PHASE=3
+      - --latency-monitor-threshold
+      - "50"
+      - --slowlog-log-slower-than
+      - "10000"
+      - --enable-debug-command
+      - "yes"          # local lab only: lets the Redis deep-dive scenarios use DEBUG POPULATE
+    ports: ["6379:6379"]
+    volumes:
+      - redis-data:/data
+
+  redis-exporter:
+    <<: *defaults
+    image: oliver006/redis_exporter:v1.77.0
+    container_name: qd-redis-exporter
+    profiles: [redis]
+    mem_limit: 64m
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: redis
+      quickdrop.metrics_port: "9121"
+      quickdrop.metrics_path: /metrics
+
+  # ---------------------------------------------------------------- apps
+
+  core-1:
+    <<: *core
+    container_name: qd-core-1
+    environment:
+      <<: *core-env
+      INSTANCE_NAME: core-1
+    ports: ["8081:8080"]
+
+  core-2:
+    <<: *core
+    container_name: qd-core-2
+    profiles: [scale]
+    environment:
+      <<: *core-env
+      INSTANCE_NAME: core-2
+    ports: ["8082:8080"]
+
+  core-3:
+    <<: *core
+    container_name: qd-core-3
+    profiles: [scale]
+    environment:
+      <<: *core-env
+      INSTANCE_NAME: core-3
+    ports: ["8083:8080"]
+
+  vendor-mock:
+    <<: *defaults
+    image: quickdrop/vendor-mock:local
+    build: { context: .., dockerfile: Dockerfile, target: vendor-mock }
+    pull_policy: build
+    container_name: qd-vendor-mock
+    cpus: 1.0
+    mem_limit: 384m
+    environment:
+      INSTANCE_NAME: vendor-mock
+      GRAFANA_URL: http://grafana:3000
+      TRACING_ENABLED: ${TRACING_ENABLED:-false}   # Phase 8
+    ports: ["8090:8080"]
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: vendor-mock
+      quickdrop.metrics_port: "8080"
+      quickdrop.metrics_path: /actuator/prometheus
+
+  # ---------------------------------------------------------------- Phase 6: Kafka and notification-service
+
+  kafka:
+    <<: *defaults
+    image: apache/kafka:3.9.1
+    container_name: qd-kafka
+    profiles: [kafka]
+    cpus: 2.0
+    mem_limit: 1g
+    environment:
+      # One node that is both broker and controller (KRaft mode: no ZooKeeper).
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk   # a base64-encoded UUID, required by KRaft
+    ports: ["29092:29092"]
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  # Creates the topics once Kafka is up, then exits.
+  kafka-init:
+    image: apache/kafka:3.9.1
+    container_name: qd-kafka-init
+    profiles: [kafka]
+    security_opt: [label=disable]
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        # name:partitions — the Kafka deep dive (Phase 7) uses the lab-* topics, the DLT and rider-status
+        for spec in notifications:6 notifications-priority:3 notifications.DLT:6 order-events:6 lab-1p:1 lab-6p:6 lab-out:6; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$${spec%%:*}" --partitions "$${spec##*:}" --replication-factor 1
+        done
+        # K10: a compacted topic keeps only the latest message per key (cleaned aggressively so it shows quickly).
+        # The cleaner never touches the active segment, so segments are small (1 MB) and roll after 10 s.
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic rider-status \
+          --partitions 3 --replication-factor 1 --config cleanup.policy=compact
+        /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka:9092 --alter --entity-type topics --entity-name rider-status \
+          --add-config segment.ms=10000,segment.bytes=1048576,min.cleanable.dirty.ratio=0.01,min.compaction.lag.ms=0,delete.retention.ms=1000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe
+
+  kafka-exporter:
+    <<: *defaults
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: qd-kafka-exporter
+    profiles: [kafka]
+    mem_limit: 128m
+    command: ["--kafka.server=kafka:9092", "--refresh.metadata=10s"]
+    depends_on:
+      kafka: { condition: service_healthy }
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: kafka
+      quickdrop.metrics_port: "9308"
+      quickdrop.metrics_path: /metrics
+
+  kafka-ui:
+    <<: *defaults
+    image: ghcr.io/kafbat/kafka-ui:v1.3.0
+    container_name: qd-kafka-ui
+    profiles: [kafka]
+    mem_limit: 512m
+    environment:
+      KAFKA_CLUSTERS_0_NAME: quickdrop
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports: ["8085:8080"]
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  # K6 (opt-in: make kafka-acks): a 3-broker cluster with a dedicated KRaft controller, so killing brokers never
+  # costs the controller quorum. Separate from the main single-node Kafka; only the acks lab uses it.
+  kafka-ctl:
+    <<: *defaults
+    image: apache/kafka:3.9.1
+    container_name: qd-kafka-ctl
+    profiles: [kafka-cluster]
+    restart: "no"
+    cpus: 0.5
+    mem_limit: 384m
+    environment: &kafka-cluster-env
+      KAFKA_NODE_ID: 100
+      KAFKA_PROCESS_ROLES: controller
+      KAFKA_LISTENERS: CONTROLLER://:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 100@kafka-ctl:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_BROKER_SESSION_TIMEOUT_MS: 6000         # a killed broker is fenced (and leaves the ISR) after 6 s
+      KAFKA_REPLICA_LAG_TIME_MAX_MS: 5000
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms128m -Xmx128m
+      CLUSTER_ID: Q2x1c3RlckFja3NMYWIwMQ
+  kafka-a: &kafka-broker
+    <<: *defaults
+    image: apache/kafka:3.9.1
+    container_name: qd-kafka-a
+    profiles: [kafka-cluster]
+    restart: "no"                                    # K6 kills brokers on purpose; don't bring them back behind its back
+    cpus: 1.0
+    mem_limit: 640m
+    depends_on: [kafka-ctl]
+    environment:
+      <<: *kafka-cluster-env
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker
+      KAFKA_LISTENERS: PLAINTEXT://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-a:9092
+      KAFKA_HEAP_OPTS: -Xms384m -Xmx384m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+  kafka-b:
+    <<: *kafka-broker
+    container_name: qd-kafka-b
+    environment:
+      <<: *kafka-cluster-env
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker
+      KAFKA_LISTENERS: PLAINTEXT://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-b:9092
+      KAFKA_HEAP_OPTS: -Xms384m -Xmx384m
+  kafka-c:
+    <<: *kafka-broker
+    container_name: qd-kafka-c
+    environment:
+      <<: *kafka-cluster-env
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: broker
+      KAFKA_LISTENERS: PLAINTEXT://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-c:9092
+      KAFKA_HEAP_OPTS: -Xms384m -Xmx384m
+
+  notification-1: &notification
+    <<: *defaults
+    image: quickdrop/notification-service:local
+    build: { context: .., dockerfile: Dockerfile, target: notification-service }
+    pull_policy: build
+    container_name: qd-notification-1
+    profiles: [kafka]
+    cpus: 1.0
+    mem_limit: 512m
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    environment: &notification-env
+      INSTANCE_NAME: notification-1
+      DB_URL: jdbc:postgresql://toxiproxy:15432/quickdrop
+      VENDOR_URL: http://toxiproxy:18090
+      REDIS_HOST: toxiproxy
+      REDIS_PORT: "16379"
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_ENABLED: "true"
+      KAFKA_CONSUMERS: "3"
+      GRAFANA_URL: http://grafana:3000
+      TRACING_ENABLED: ${TRACING_ENABLED:-false}   # Phase 8
+    ports: ["8091:8080"]
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: notification
+      quickdrop.metrics_port: "8080"
+      quickdrop.metrics_path: /actuator/prometheus
+
+  notification-2:
+    <<: *notification
+    container_name: qd-notification-2
+    environment:
+      <<: *notification-env
+      INSTANCE_NAME: notification-2
+    ports: ["8092:8080"]
+
+  # ---------------------------------------------------------------- network
+
+  # Every app -> dependency connection goes through Toxiproxy so we can add latency or cut it.
+  toxiproxy:
+    <<: *defaults
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    container_name: qd-toxiproxy
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    mem_limit: 128m
+    ports: ["8474:8474"]
+    volumes:
+      - ./toxiproxy/toxiproxy.json:/config/toxiproxy.json:ro
+
+  nginx:
+    <<: *defaults
+    image: nginx:1.28.0-alpine
+    container_name: qd-nginx
+    cpus: 1.0
+    mem_limit: 128m
+    depends_on: [core-1]
+    ports: ["8080:80"]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/upstreams/${CORE_UPSTREAMS:-single}.conf:/etc/nginx/upstream.conf:ro
+
+  nginx-exporter:
+    <<: *defaults
+    image: nginx/nginx-prometheus-exporter:1.4.2
+    container_name: qd-nginx-exporter
+    profiles: [scale]
+    mem_limit: 64m
+    command: ["--nginx.scrape-uri=http://nginx/nginx_status"]
+    depends_on: [nginx]
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: nginx
+      quickdrop.metrics_port: "9113"
+      quickdrop.metrics_path: /metrics
+
+  # ---------------------------------------------------------------- observability
+
+  prometheus:
+    <<: *defaults
+    image: prom/prometheus:v3.5.0
+    container_name: qd-prometheus
+    user: root   # needs the Docker socket for service discovery
+    mem_limit: 768m
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-remote-write-receiver   # k6 (and Tempo's metrics generator, Phase 8) push metrics here
+      - --enable-feature=exemplar-storage    # Phase 8: latency samples carry a trace id you can click
+      - --web.enable-lifecycle
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  grafana:
+    <<: *defaults
+    image: grafana/grafana:12.2.0
+    container_name: qd-grafana
+    mem_limit: 384m
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/overview.json
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports: ["3000:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+  postgres-exporter:
+    <<: *defaults
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.18.1
+    container_name: qd-postgres-exporter
+    mem_limit: 128m
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATA_SOURCE_URI: postgres:5432/quickdrop?sslmode=disable
+      DATA_SOURCE_USER: quickdrop
+      DATA_SOURCE_PASS: quickdrop
+    command:
+      - --collector.stat_statements
+      - --collector.stat_statements.include_query
+      - --collector.stat_statements.query_length=200
+      - --extend.query-path=/etc/postgres-exporter/queries.yml
+    volumes:
+      - ./postgres/exporter-queries.yml:/etc/postgres-exporter/queries.yml:ro
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: postgres
+      quickdrop.metrics_port: "9187"
+      quickdrop.metrics_path: /metrics
+
+  cadvisor:
+    <<: *defaults
+    image: ghcr.io/google/cadvisor:v0.57.0
+    container_name: qd-cadvisor
+    privileged: true
+    mem_limit: 256m
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=5s
+      - --store_container_labels=false
+      - --disable_metrics=percpu,sched,tcp,udp,disk,diskIO,hugetlb,referenced_memory,cpu_topology,resctrl,advtcp,process,memory_numa
+    devices: [/dev/kmsg]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: cadvisor
+      quickdrop.metrics_port: "8080"
+      quickdrop.metrics_path: /metrics
+
+  loki:
+    <<: *defaults
+    image: grafana/loki:3.5.5
+    container_name: qd-loki
+    mem_limit: 384m
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+
+  alloy:
+    <<: *defaults
+    image: grafana/alloy:v1.10.2
+    container_name: qd-alloy
+    mem_limit: 192m
+    command: ["run", "/etc/alloy/config.alloy", "--storage.path=/var/lib/alloy/data"]
+    depends_on: [loki]
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # Phase 8: traces. Every service sends spans over OTLP when TRACING_ENABLED=true (make up PHASE=8).
+  tempo:
+    <<: *defaults
+    image: grafana/tempo:2.10.8
+    container_name: qd-tempo
+    profiles: [tracing]
+    mem_limit: 512m
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    volumes:
+      - ./tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+    ports: ["3200:3200"]
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: tempo
+      quickdrop.metrics_port: "3200"
+      quickdrop.metrics_path: /metrics
+
+  # Phase 8: routes Prometheus alerts to a webhook in notification-service.
+  alertmanager:
+    <<: *defaults
+    image: prom/alertmanager:v0.34.1
+    container_name: qd-alertmanager
+    profiles: [alerting]
+    mem_limit: 128m
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports: ["9093:9093"]
+    labels:
+      quickdrop.scrape: "true"
+      quickdrop.job: alertmanager
+      quickdrop.metrics_port: "9093"
+      quickdrop.metrics_path: /metrics
+
+  # ---------------------------------------------------------------- tools (run on demand)
+
+  k6:
+    image: grafana/k6:1.3.0
+    profiles: [tools]
+    security_opt: [label=disable]
+    environment:
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_TREND_STATS: "p(50),p(95),p(99),max"
+      K6_PROMETHEUS_RW_PUSH_INTERVAL: 5s
+      BASE_URL: http://nginx
+      CORE_URLS: ${CORE_URLS:-http://core-1:8080}
+      VENDOR_URL: http://vendor-mock:8080
+      TOXIPROXY_URL: http://toxiproxy:8474
+      PROMETHEUS_URL: http://prometheus:9090
+      NOTIFY_URLS: http://notification-1:8080,http://notification-2:8080
+    volumes:
+      - ../loadtest/k6:/scripts:ro
+
+volumes:
+  kafka-data:
+  pgdata:
+  pgdata-replica:
+  pgdata-shard-0:
+  pgdata-shard-1:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:

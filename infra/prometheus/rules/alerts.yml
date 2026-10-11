@@ -1,0 +1,121 @@
+# Alert rules (Phase 8, scenario 8.2). Prometheus evaluates them in every phase (see http://localhost:9090/alerts);
+# from Phase 8 Alertmanager routes them to a webhook in notification-service (GET /api/alerts lists what arrived).
+#
+# Two kinds, on purpose:
+#   symptoms: what customers feel (failed or slow checkouts, late OTPs). These page someone.
+#   causes:   CPU, pools, instances. Useful on a dashboard, noisy as pages: they fire when nobody is hurt and
+#             stay silent for problems nobody predicted.
+#
+# The checkout SLO: 99.5% of POST /api/orders don't fail with a 5xx (error budget 0.5%). Burn-rate alerts follow
+# the Google SRE workbook (multiwindow, multi-burn-rate), with every window divided by 12 so a lab run of a few
+# minutes behaves like hours of production: 1 h → 5 m, 5 m → 1 m (shortest window that works with 5 s scrapes),
+# 6 h → 30 m, 30 m → 3 m.
+groups:
+  - name: quickdrop-slo-recording
+    rules:
+      - record: quickdrop:checkout_errors:ratio_rate1m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="core", method="POST", uri="/api/orders", status=~"5.."}[1m]))
+          / sum(rate(http_server_requests_seconds_count{job="core", method="POST", uri="/api/orders"}[1m]))
+      - record: quickdrop:checkout_errors:ratio_rate3m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="core", method="POST", uri="/api/orders", status=~"5.."}[3m]))
+          / sum(rate(http_server_requests_seconds_count{job="core", method="POST", uri="/api/orders"}[3m]))
+      - record: quickdrop:checkout_errors:ratio_rate5m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="core", method="POST", uri="/api/orders", status=~"5.."}[5m]))
+          / sum(rate(http_server_requests_seconds_count{job="core", method="POST", uri="/api/orders"}[5m]))
+      - record: quickdrop:checkout_errors:ratio_rate30m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="core", method="POST", uri="/api/orders", status=~"5.."}[30m]))
+          / sum(rate(http_server_requests_seconds_count{job="core", method="POST", uri="/api/orders"}[30m]))
+
+  - name: quickdrop-symptoms
+    rules:
+      - alert: CheckoutErrorBudgetFastBurn
+        # 14.4× the allowed error rate: at this pace a 30-day budget is gone in ~2 days. Both windows must agree:
+        # the long one proves it's sustained, the short one makes it resolve quickly once fixed.
+        expr: |
+          quickdrop:checkout_errors:ratio_rate5m > (14.4 * 0.005)
+          and quickdrop:checkout_errors:ratio_rate1m > (14.4 * 0.005)
+        labels: { severity: page, kind: symptom }
+        annotations:
+          summary: "Checkouts are failing: {{ $value | humanizePercentage }} errors over the last minute (SLO allows 0.5%)"
+          runbook: scenarios/phase-8/8.2-alerts.md
+      - alert: CheckoutErrorBudgetSlowBurn
+        # 6× the allowed rate for a long time: not an emergency, but the budget will run out. A ticket, not a page.
+        expr: |
+          quickdrop:checkout_errors:ratio_rate30m > (6 * 0.005)
+          and quickdrop:checkout_errors:ratio_rate3m > (6 * 0.005)
+        labels: { severity: ticket, kind: symptom }
+        annotations:
+          summary: "Checkout errors at {{ $value | humanizePercentage }}: slowly burning the error budget"
+          runbook: scenarios/phase-8/8.2-alerts.md
+      - alert: CheckoutSlow
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{job="core", method="POST", uri="/api/orders"}[1m]))) > 1
+        for: 1m
+        labels: { severity: page, kind: symptom }
+        annotations:
+          summary: "Checkout p99 is {{ $value | humanizeDuration }} (target: under 1 s)"
+      - alert: OtpDelayed
+        # OTPs are useless after a minute or two (6.8).
+        expr: sum(notify_consumer_lag{group="notification-service-priority"}) > 50
+        for: 30s
+        labels: { severity: page, kind: symptom }
+        annotations:
+          summary: "{{ $value }} OTPs waiting to be sent"
+      - alert: NotificationBacklogGrowing
+        expr: |
+          sum(notify_consumer_lag{group="notification-service"}) > 1000
+          and deriv(sum(notify_consumer_lag{group="notification-service"})[2m:10s]) > 0
+        for: 2m
+        labels: { severity: ticket, kind: symptom }
+        annotations:
+          summary: "Notification backlog at {{ $value }} and still growing: consumers aren't keeping up"
+      - alert: MessagesDeadLettered
+        expr: sum(increase(notify_poison_total{outcome="dead_lettered"}[10m])) > 0
+        labels: { severity: ticket, kind: symptom }
+        annotations:
+          summary: "Messages moved to notifications.DLT in the last 10 minutes: someone has to look at them (K4)"
+
+  - name: quickdrop-causes
+    rules:
+      - alert: HighCpu
+        expr: |
+          max by (container) (rate(container_cpu_usage_seconds_total{container=~"core-.*|notification-.*|postgres"}[1m]))
+          / max by (container) (container_spec_cpu_quota{container=~"core-.*|notification-.*|postgres"} / container_spec_cpu_period{container=~"core-.*|notification-.*|postgres"})
+          > 0.8
+        for: 15s
+        labels: { severity: warning, kind: cause }
+        annotations:
+          summary: "{{ $labels.container }} is using {{ $value | humanizePercentage }} of its CPU limit"
+      - alert: DbPoolWaiting
+        expr: max by (instance) (hikaricp_connections_pending{job="core"}) > 0
+        for: 15s
+        labels: { severity: warning, kind: cause }
+        annotations:
+          summary: "{{ $labels.instance }}: requests are waiting for a database connection"
+      - alert: InstanceDown
+        expr: up{job=~"core|notification"} == 0
+        for: 30s
+        labels: { severity: warning, kind: cause }
+        annotations:
+          summary: "{{ $labels.instance }} is down (the load balancer should be routing around it)"
+
+  - name: quickdrop-meta
+    rules:
+      - alert: ScrapeTargetDown
+        # A broken exporter doesn't hurt customers, but every panel that depends on it goes blank. postgres-exporter
+        # returned HTTP 500 for 3.5 hours in Phase 7 and nobody noticed (docs/FAILURE_TRACKER.md).
+        expr: up{job!~"core|notification"} == 0
+        for: 2m
+        labels: { severity: ticket, kind: meta }
+        annotations:
+          summary: "Prometheus can't scrape {{ $labels.job }} ({{ $labels.instance }}): its dashboards are blind"
+      - alert: Watchdog
+        # Always firing. If the receiver stops hearing it, the alerting pipeline itself is broken.
+        expr: vector(1)
+        labels: { severity: none, kind: meta }
+        annotations:
+          summary: "Alerting pipeline heartbeat"

@@ -1,0 +1,8 @@
+[
+  { "name": "postgres", "listen": "0.0.0.0:15432", "upstream": "postgres:5432", "enabled": true },
+  { "name": "vendor",   "listen": "0.0.0.0:18090", "upstream": "vendor-mock:8080", "enabled": true },
+  { "name": "redis",    "listen": "0.0.0.0:16379", "upstream": "redis:6379", "enabled": true },
+  { "name": "replica",  "listen": "0.0.0.0:15433", "upstream": "postgres-replica:5432", "enabled": true },
+  { "name": "shard0",   "listen": "0.0.0.0:15434", "upstream": "pg-shard-0:5432", "enabled": true },
+  { "name": "shard1",   "listen": "0.0.0.0:15435", "upstream": "pg-shard-1:5432", "enabled": true }
+]

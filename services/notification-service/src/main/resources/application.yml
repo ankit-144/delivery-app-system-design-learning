@@ -1,0 +1,98 @@
+spring:
+  application:
+    name: notification-service
+  datasource:
+    # The SAME Postgres server as core-service, on purpose: scenario 6.4 shows what that costs.
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/quickdrop}
+    username: ${DB_USER:quickdrop}
+    password: ${DB_PASSWORD:quickdrop}
+    hikari:
+      pool-name: notify-pool
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      schema: notify                 # this service's tables live in the notify schema (Flyway creates it)
+  flyway:
+    schemas: notify                  # own schema, own history table: never touches core's tables
+    default-schema: notify
+    locations: classpath:db/notify
+    table: flyway_schema_history
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 1000ms
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    consumer:
+      group-id: notification-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      max-poll-records: 50
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      ack-mode: record
+      concurrency: ${KAFKA_CONSUMERS:3}
+      auto-startup: ${KAFKA_ENABLED:false}
+      observation-enabled: ${TRACING_ENABLED:false}   # Phase 8: continue the producer's trace
+    template:
+      observation-enabled: ${TRACING_ENABLED:false}
+  threads:
+    virtual:
+      enabled: true
+
+server:
+  port: 8080
+  tomcat:
+    threads:
+      max: 50
+    # With virtual threads the thread limit above doesn't apply: every accepted connection gets its own thread.
+    # The 8,192 default let a retry storm (8.3) pile up enough in-flight requests to run the heap out of memory.
+    # Beyond this many, new connections wait in the OS backlog or are refused: callers fail fast instead.
+    max-connections: 1000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  health:
+    redis:
+      enabled: false
+    kafka:
+      enabled: false
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        notify.delivery.delay: true
+  # Phase 8: distributed tracing. Off until `make up PHASE=8` sets TRACING_ENABLED=true and starts Tempo.
+  tracing:
+    enabled: ${TRACING_ENABLED:false}
+    sampling:
+      probability: ${TRACING_SAMPLING:1.0}   # 100%: fine for a lab, far too much for production traffic (see 8.1)
+  otlp:
+    tracing:
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://tempo:4318/v1/traces}
+  observations:
+    enable:
+      "[tasks.scheduled]": false   # background polling (outbox relay every 200 ms, invariant checker) would flood Tempo
+
+quickdrop:
+  instance-name: ${INSTANCE_NAME:notify-local}
+  grafana:
+    url: ${GRAFANA_URL:}
+  vendor:
+    base-url: ${VENDOR_URL:http://localhost:8090}
+
+# Phase 8: a span for every connection checkout and SQL statement (datasource-micrometer), only when tracing is on.
+jdbc:
+  datasource-proxy:
+    enabled: ${TRACING_ENABLED:false}
+    include-parameter-values: false
+  includes: CONNECTION, QUERY

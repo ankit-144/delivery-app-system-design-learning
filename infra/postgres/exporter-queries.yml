@@ -1,0 +1,70 @@
+# Extra metrics for postgres-exporter. Each top-level key becomes a metric prefix.
+
+# Sessions waiting for a lock right now, by the kind of lock they want.
+pg_lock_waits:
+  query: |
+    SELECT coalesce(l.mode, 'unknown') AS mode, count(*) AS waiting
+    FROM pg_locks l
+    WHERE NOT l.granted
+    GROUP BY l.mode
+  metrics:
+    - mode:
+        usage: LABEL
+        description: Lock mode being waited for
+    - waiting:
+        usage: GAUGE
+        description: Sessions waiting for this lock mode
+
+# Connections by state and wait event: shows "idle in transaction" and lock queues.
+pg_connections:
+  query: |
+    SELECT coalesce(state, 'background') AS state,
+           coalesce(wait_event_type, 'none') AS wait_event_type,
+           coalesce(application_name, '') AS application_name,
+           count(*) AS count
+    FROM pg_stat_activity
+    WHERE datname = current_database()
+    GROUP BY 1, 2, 3
+  metrics:
+    - state:
+        usage: LABEL
+        description: Connection state (active, idle, idle in transaction, ...)
+    - wait_event_type:
+        usage: LABEL
+        description: What an active connection is waiting on (Lock, IO, Client, ...)
+    - application_name:
+        usage: LABEL
+        description: Client application name
+    - count:
+        usage: GAUGE
+        description: Number of connections
+
+# Sequential vs index scans per table: a missing index shows up as seq_tup_read climbing.
+# schemaname is a label because table names repeat across schemas: from Phase 6, notification-service has its own
+# notify.flyway_schema_history, and duplicate series made the exporter fail every scrape (HTTP 500) until we noticed.
+pg_table_scans:
+  query: |
+    SELECT schemaname, relname, seq_scan, seq_tup_read, coalesce(idx_scan, 0) AS idx_scan, n_live_tup, n_dead_tup
+    FROM pg_stat_user_tables
+  metrics:
+    - schemaname:
+        usage: LABEL
+        description: Schema
+    - relname:
+        usage: LABEL
+        description: Table
+    - seq_scan:
+        usage: COUNTER
+        description: Sequential scans started
+    - seq_tup_read:
+        usage: COUNTER
+        description: Rows read by sequential scans
+    - idx_scan:
+        usage: COUNTER
+        description: Index scans started
+    - n_live_tup:
+        usage: GAUGE
+        description: Estimated live rows
+    - n_dead_tup:
+        usage: GAUGE
+        description: Estimated dead rows (bloat waiting for vacuum)

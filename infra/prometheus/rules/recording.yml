@@ -1,0 +1,5 @@
+groups:
+  - name: quickdrop-recording
+    rules:
+      - record: quickdrop:http_requests:rate1m
+        expr: sum by (job, instance, uri, method, status) (rate(http_server_requests_seconds_count{uri=~"/api/.*"}[1m]))
